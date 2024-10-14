@@ -28,6 +28,12 @@ pub struct DataTree<'a> {
     raw: *mut ffi::lyd_node,
 }
 
+#[derive(Debug)]
+pub struct DataTreeOwningRef<'a> {
+    pub tree: DataTree<'a>,
+    raw: *mut ffi::lyd_node,
+}
+
 /// YANG data node reference.
 #[derive(Clone, Debug)]
 pub struct DataNodeRef<'a, 'b> {
@@ -530,6 +536,97 @@ impl<'a> DataTree<'a> {
         Ok(unsafe { DataTree::from_raw(context, rnode) })
     }
 
+    pub fn _parse_op(
+        &'a mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+        op_type: ffi::lyd_type::Type,
+    ) -> Result<DataNodeRef<'a, 'a>> {
+        let mut op_node = std::ptr::null_mut();
+        let mut env_node = std::ptr::null_mut();
+
+        // Create input handler.
+        let mut ly_in = std::ptr::null_mut();
+        let ret = if data.as_ref().is_empty() {
+            let blank = CString::new("").unwrap();
+            unsafe { ffi::ly_in_new_memory(blank.as_ptr() as _, &mut ly_in) }
+        } else {
+            unsafe {
+                ffi::ly_in_new_memory(data.as_ref().as_ptr() as _, &mut ly_in)
+            }
+        };
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.context));
+        }
+
+        let ret = unsafe {
+            ffi::lyd_parse_op(
+                self.context.raw,
+                std::ptr::null_mut(),
+                ly_in,
+                format as u32,
+                op_type,
+                &mut env_node,
+                &mut op_node,
+            )
+        };
+
+        // Can be set even on error, we don't use opaq wrapper.
+        unsafe { ffi::lyd_free_all(env_node) };
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.context));
+        }
+
+        let result = unsafe { DataNodeRef::from_raw(self, op_node) };
+        Ok(result)
+    }
+
+    /// Parse RPC with input args from NETCONF (i.e. in XML)
+    pub fn parse_netconf_rpc_op(
+        &'a mut self,
+        data: impl AsRef<[u8]>,
+    ) -> Result<DataNodeRef<'a, 'a>> {
+        self._parse_op(
+            data,
+            DataFormat::XML,
+            ffi::lyd_type::LYD_TYPE_RPC_NETCONF,
+        )
+    }
+
+    /// Parse NOTIFICATION with args from NETCONF (i.e. in XML)
+    pub fn parse_netconf_notif_op(
+        &'a mut self,
+        data: impl AsRef<[u8]>,
+    ) -> Result<DataNodeRef<'a, 'a>> {
+        self._parse_op(
+            data,
+            DataFormat::XML,
+            ffi::lyd_type::LYD_TYPE_NOTIF_NETCONF,
+        )
+    }
+
+    /// Parse NOTIFICATION with args from RESTCONF (in either JSON or XML)
+    pub fn parse_restconf_notif_op(
+        &'a mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+    ) -> Result<DataNodeRef<'a, 'a>> {
+        if format == DataFormat::XML {
+            self._parse_op(
+                data,
+                DataFormat::XML,
+                ffi::lyd_type::LYD_TYPE_NOTIF_NETCONF,
+            )
+        } else {
+            self._parse_op(
+                data,
+                DataFormat::JSON,
+                ffi::lyd_type::LYD_TYPE_NOTIF_RESTCONF,
+            )
+        }
+    }
+
     /// Returns a reference to the fist top-level data node, unless the data
     /// tree is empty.
     pub fn reference<'b>(&'b self) -> Option<DataNodeRef<'b, 'a>> {
@@ -541,6 +638,66 @@ impl<'a> DataTree<'a> {
                 raw: self.raw,
             })
         }
+    }
+
+    unsafe fn reroot(&mut self, raw: *mut ffi::lyd_node) {
+        if self.raw.is_null() {
+            let mut dnode = DataNodeRef::from_raw(self, raw);
+            while let Some(parent) = dnode.parent() {
+                dnode = parent;
+            }
+            self.raw = dnode.raw();
+        }
+        self.raw = ffi::lyd_first_sibling(self.raw);
+    }
+
+    fn _new_path2(
+        &mut self,
+        path: &str,
+        value: Option<&str>,
+        output: bool,
+    ) -> Result<*mut ffi::lyd_node> {
+        let path = CString::new(path).unwrap();
+        let mut rnode_root = std::ptr::null_mut();
+        let mut rnode = std::ptr::null_mut();
+        let rnode_root_ptr = &mut rnode_root;
+        let rnode_ptr = &mut rnode;
+        let value_cstr;
+
+        let (value_ptr, value_len) = match value {
+            Some(value) => {
+                value_cstr = CString::new(value).unwrap();
+                (value_cstr.as_ptr(), value.len())
+            }
+            None => (std::ptr::null(), 0),
+        };
+
+        let mut options = ffi::LYD_NEW_PATH_UPDATE;
+        if output {
+            options |= ffi::LYD_NEW_VAL_OUTPUT;
+        }
+
+        let ret = unsafe {
+            ffi::lyd_new_path2(
+                self.raw,
+                self.context.raw,
+                path.as_ptr(),
+                value_ptr as *const c_void,
+                value_len,
+                ffi::LYD_ANYDATA_VALUETYPE::LYD_ANYDATA_STRING,
+                options,
+                rnode_root_ptr,
+                rnode_ptr,
+            )
+        };
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.context));
+        }
+
+        unsafe {self.reroot(rnode)};
+
+        Ok(rnode)
     }
 
     /// Create a new node or modify existing one in the data tree based on a
@@ -564,51 +721,8 @@ impl<'a> DataTree<'a> {
         value: Option<&str>,
         output: bool,
     ) -> Result<Option<DataNodeRef<'_, '_>>> {
-        let path = CString::new(path).unwrap();
-        let mut rnode_root = std::ptr::null_mut();
-        let mut rnode = std::ptr::null_mut();
-        let rnode_root_ptr = &mut rnode_root;
-        let rnode_ptr = &mut rnode;
-        let value_cstr;
-
-        let (value_ptr, value_len) = match value {
-            Some(value) => {
-                value_cstr = CString::new(value).unwrap();
-                (value_cstr.as_ptr(), value.len())
-            }
-            None => (std::ptr::null(), 0),
-        };
-
-        let mut options = ffi::LYD_NEW_PATH_UPDATE;
-        if output {
-            options |= ffi::LYD_NEW_VAL_OUTPUT;
-        }
-
-        let ret = unsafe {
-            ffi::lyd_new_path2(
-                self.raw(),
-                self.context().raw,
-                path.as_ptr(),
-                value_ptr as *const c_void,
-                value_len,
-                ffi::LYD_ANYDATA_VALUETYPE::LYD_ANYDATA_STRING,
-                options,
-                rnode_root_ptr,
-                rnode_ptr,
-            )
-        };
-        if ret != ffi::LY_ERR::LY_SUCCESS {
-            return Err(Error::new(self.context()));
-        }
-
-        // Update top-level sibling.
-        if self.raw.is_null() {
-            self.raw = unsafe { ffi::lyd_first_sibling(rnode_root) };
-        } else {
-            self.raw = unsafe { ffi::lyd_first_sibling(self.raw) };
-        }
-
-        Ok(unsafe { DataNodeRef::from_raw_opt(self.tree(), rnode) })
+        let raw = self._new_path2(path, value, output)?;
+        Ok(unsafe { DataNodeRef::from_raw_opt(self, raw) })
     }
 
     /// Remove a data node.
@@ -788,6 +902,153 @@ impl Drop for DataTree<'_> {
         unsafe { ffi::lyd_free_all(self.raw) };
     }
 }
+
+// ===== impl DataTreeOwningRef =====
+
+impl<'a> DataTreeOwningRef<'a> {
+    unsafe fn from_raw(tree: DataTree<'a>, raw: *mut ffi::lyd_node) -> Self {
+        DataTreeOwningRef { tree, raw }
+    }
+
+    /// Create a new node or modify existing one in the data tree based on a
+    /// path.
+    ///
+    /// If path points to a list key and the list instance does not exist,
+    /// the key value from the predicate is used and value is ignored. Also,
+    /// if a leaf-list is being created and both a predicate is defined in
+    /// path and value is set, the predicate is preferred.
+    ///
+    /// For key-less lists and state leaf-lists, positional predicates can be
+    /// used. If no preciate is used for these nodes, they are always created.
+    ///
+    /// The output parameter can be used to change the behavior to ignore
+    /// RPC/action input schema nodes and use only output ones.
+    ///
+    /// Returns the last created or modified node (if any).
+    pub fn new_path(
+        context: &'a Context,
+        path: &str,
+        value: Option<&str>,
+        output: bool,
+    ) -> Result<Self> {
+        let mut tree = DataTree::new(context);
+        let raw = {
+            match tree.new_path(path, value, output)? {
+                Some(node) => node.raw,
+                None => tree.find_path(path)?.raw
+            }
+        };
+        Ok(unsafe { DataTreeOwningRef::from_raw(tree, raw) })
+    }
+
+    pub fn noderef(&'a self) -> DataNodeRef<'a, 'a> {
+        DataNodeRef {
+            tree: &self.tree,
+            raw: self.raw,
+        }
+    }
+
+    pub fn _parse_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+        op_type: ffi::lyd_type::Type,
+    ) -> Result<()> {
+        let mut opaque = std::ptr::null_mut();
+        let opaque_ptr = &mut opaque;
+
+        // Create input handler.
+        let mut ly_in = std::ptr::null_mut();
+        let ret = if data.as_ref().is_empty() {
+            let blank = CString::new("").unwrap();
+            unsafe { ffi::ly_in_new_memory(blank.as_ptr() as _, &mut ly_in) }
+        } else {
+            unsafe {
+                ffi::ly_in_new_memory(data.as_ref().as_ptr() as _, &mut ly_in)
+            }
+        };
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.tree.context));
+        }
+
+        let ret = unsafe {
+            ffi::lyd_parse_op(
+                self.tree.context.raw,
+                self.raw,
+                ly_in,
+                format as u32,
+                op_type,
+                opaque_ptr,
+                std::ptr::null_mut(),
+            )
+        };
+
+        unsafe { ffi::ly_in_free(ly_in, 0) };
+        unsafe { ffi::lyd_free_all(opaque) }; // Can be set on error.
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.tree.context));
+        }
+
+        Ok(())
+    }
+
+    /// Parse RPC REPLY with output args from NETCONF (in XML)
+    pub fn parse_netconf_reply_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self._parse_op(data, DataFormat::XML, ffi::lyd_type::LYD_TYPE_REPLY_NETCONF)
+    }
+
+    /// Parse RPC with input args from RESTCONF (in JSON or XML)
+    pub fn parse_restconf_rpc_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+    ) -> Result<()> {
+        self._parse_op(data, format, ffi::lyd_type::LYD_TYPE_RPC_RESTCONF)
+    }
+
+    /// Parse RPC REPLY with output args from RESTCONF (in JSON or XML)
+    pub fn parse_restconf_reply_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+    ) -> Result<()> {
+        self._parse_op(data, format, ffi::lyd_type::LYD_TYPE_REPLY_RESTCONF)
+    }
+}
+
+impl<'a> From<DataTree<'a>> for DataTreeOwningRef<'a> {
+    fn from(tree: DataTree<'a>) -> DataTreeOwningRef<'a> {
+        let raw = tree.raw;
+        unsafe { DataTreeOwningRef::from_raw(tree, raw) }
+    }
+}
+
+impl<'a> From<&'a DataTreeOwningRef<'_>> for DataNodeRef<'a, 'a> {
+    fn from(tree: &'a DataTreeOwningRef<'_>) -> DataNodeRef<'a, 'a> {
+        DataNodeRef {
+            tree: &tree.tree,
+            raw: tree.raw,
+        }
+    }
+}
+
+impl<'a> Data<'a> for DataTreeOwningRef<'a> {
+    fn tree(&self) -> &DataTree<'a> {
+        &self.tree
+    }
+
+    fn raw(&self) -> *mut ffi::lyd_node {
+        self.raw
+    }
+}
+
+unsafe impl Send for DataTreeOwningRef<'_> {}
+unsafe impl Sync for DataTreeOwningRef<'_> {}
 
 // ===== impl DataNodeRef =====
 
@@ -1123,6 +1384,86 @@ impl<'a, 'b> DataNodeRef<'a, 'b> {
         }
 
         Ok(())
+    }
+
+    pub fn _parse_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+        op_type: ffi::lyd_type::Type,
+    ) -> Result<()> {
+        let mut rnode = std::ptr::null_mut();
+        let rnode_ptr = &mut rnode;
+
+        // Create input handler.
+        let mut ly_in = std::ptr::null_mut();
+        let ret = if data.as_ref().is_empty() {
+            let blank = CString::new("").unwrap();
+            unsafe { ffi::ly_in_new_memory(blank.as_ptr() as _, &mut ly_in) }
+        } else {
+            unsafe {
+                ffi::ly_in_new_memory(data.as_ref().as_ptr() as _, &mut ly_in)
+            }
+        };
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.tree.context));
+        }
+
+        let ret = unsafe {
+            ffi::lyd_parse_op(
+                self.tree.context.raw,
+                self.raw,
+                ly_in,
+                format as u32,
+                op_type,
+                rnode_ptr,
+                std::ptr::null_mut(),
+            )
+        };
+
+        unsafe { ffi::ly_in_free(ly_in, 0) };
+        // Can be set even on error, we don't use opaq wrapper.
+        unsafe { ffi::lyd_free_all(rnode) };
+
+        if ret != ffi::LY_ERR::LY_SUCCESS {
+            return Err(Error::new(self.tree.context));
+        }
+
+        Ok(())
+    }
+
+    /// Parse RPC REPLY with output args from NETCONF (in XML)
+    pub fn parse_netconf_reply_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+    ) -> Result<Self> {
+        self._parse_op(
+            data,
+            DataFormat::XML,
+            ffi::lyd_type::LYD_TYPE_REPLY_NETCONF,
+        )?;
+        Ok(unsafe { DataNodeRef::from_raw(self.tree, self.raw) })
+    }
+
+    /// Parse RPC with input args from RESTCONF (in JSON or XML)
+    pub fn parse_restconf_rpc_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+    ) -> Result<Self> {
+        self._parse_op(data, format, ffi::lyd_type::LYD_TYPE_RPC_RESTCONF)?;
+        Ok(unsafe { DataNodeRef::from_raw(self.tree, self.raw) })
+    }
+
+    /// Parse RPC REPLY with output args from RESTCONF (in JSON or XML)
+    pub fn parse_restconf_reply_op(
+        &mut self,
+        data: impl AsRef<[u8]>,
+        format: DataFormat,
+    ) -> Result<Self> {
+        self._parse_op(data, format, ffi::lyd_type::LYD_TYPE_REPLY_RESTCONF)?;
+        Ok(unsafe { DataNodeRef::from_raw(self.tree, self.raw) })
     }
 
     /// Remove the data node.
